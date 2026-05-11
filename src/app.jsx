@@ -1,11 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { primaryPumpModels, rootsModels } from "./data/pumps";
 import { calculateToolingVolume } from "./utils/toolingVolume";
-import { calculateNetwork } from "./utils/network";
+import { calculateNetwork, calculatePipeVolume } from "./utils/network";
 
 const STORAGE_KEY = "vacuum-multivac-state";
+const ATM = 1013;
 
 export default function App() {
+  /* ───────── STATE ───────── */
+
   const [s, setS] = useState(() => {
     const saved = localStorage.getItem(STORAGE_KEY);
     return saved
@@ -20,19 +23,25 @@ export default function App() {
 
           /* Source */
           sourceType: "network", // network | pump
-          networkPressure: 30, // mbar abs
+          networkPressure: 35,
           pumpModel: "Busch R5 RA 0250",
 
           /* Roots */
           rootsModel: "Aucune",
 
-          /* Réseau */
+          /* Réseau AMONT vannes */
           mainLength: "",
+          mainDiameter: 60,
           rootsLength: "3",
-          distributionType: "close",
-          distributionLength: "",
-          distributionDiameter: 32,
 
+          /* Vannes */
+          valvePosition: "close", // close | remote
+
+          /* Réseau AVAL vannes */
+          downstreamLength: "",
+          downstreamDiameter: 32,
+
+          /* Coudes */
           smallBendsBefore: 0,
           largeBendsBefore: 0,
           smallBendsAfter: 0,
@@ -49,20 +58,23 @@ export default function App() {
 
   const u = (k, v) => setS((p) => ({ ...p, [k]: v }));
 
-  /* ───────── Volume outillage ───────── */
-  const toolingVolume = useMemo(() => calculateToolingVolume(s), [s]);
+  /* ───────── VOLUMES ───────── */
 
-  /* ───────── Réseau ───────── */
+  const volumeOutillage = useMemo(
+    () => calculateToolingVolume(s),
+    [s]
+  );
+
   const network = useMemo(
     () =>
       calculateNetwork({
         mainLength: +s.mainLength || 0,
-        mainDiameter: 60,
+        mainDiameter: +s.mainDiameter,
         hasRoots: s.rootsModel !== "Aucune",
         rootsLength: +s.rootsLength || 0,
-        distributionType: s.distributionType,
-        distributionLength: +s.distributionLength || 0,
-        distributionDiameter: +s.distributionDiameter,
+        distributionType: "none",
+        distributionLength: 0,
+        distributionDiameter: 60,
         smallBendsBefore: +s.smallBendsBefore || 0,
         largeBendsBefore: +s.largeBendsBefore || 0,
         smallBendsAfter: +s.smallBendsAfter || 0,
@@ -71,24 +83,32 @@ export default function App() {
     [s]
   );
 
-  const totalVolume = toolingVolume + network.volume;
+  const volumeAval =
+    volumeOutillage +
+    (s.valvePosition === "remote"
+      ? calculatePipeVolume(
+          +s.downstreamLength || 0,
+          +s.downstreamDiameter
+        )
+      : 0);
 
-  /* ───────── Débit source ───────── */
+  const volumeAmont = network.volume;
+  const penalty = Math.max(network.penalty, 1);
+
+  /* ───────── DÉBITS ───────── */
+
   function sourceFlow(p) {
     if (s.sourceType === "pump") {
       return primaryPumpModels[s.pumpModel]?.flow(p) || 0;
     }
 
-    /* Réseau de vide : dépend de la pression réseau */
-    const pNet = +s.networkPressure || 0;
-    if (pNet <= 0) return 0;
+    const pNet = Number(s.networkPressure);
+    if (!pNet || pNet <= 0) return 0;
 
-    // approximation terrain : plus le réseau est bas, plus le débit dispo chute
-    if (p > pNet) return 0.12;
-    if (p > 100) return 0.1;
-    if (p > 40) return 0.08;
-    if (p > 10) return 0.06;
-    return 0.045;
+    if (p > 100) return 0.12;
+    if (p > 40) return 0.10;
+    if (p > 10) return 0.07;
+    return 0.05;
   }
 
   function rootsGain(p) {
@@ -97,94 +117,174 @@ export default function App() {
     return r.gain(p);
   }
 
-  /* ───────── Calcul temps (continu) ───────── */
-  const time = useMemo(() => {
-    if (totalVolume <= 0) return null;
+  /* ───────── CALCUL TEMPS (2 PHASES) ───────── */
 
-    const pStart = 1000;
-    const pEnd = +s.finalPressure;
-    if (!pEnd || pEnd <= 0 || pEnd >= pStart) return null;
+  const time = useMemo(() => {
+    if (volumeAval <= 0) return null;
+
+    const pReseau =
+      s.sourceType === "network"
+        ? Number(s.networkPressure)
+        : ATM;
+
+    const pFinal = Number(s.finalPressure);
+    if (!pReseau || !pFinal || pFinal <= 0) return null;
 
     let t = 0;
-    let p = pStart;
     const steps = 40;
-    const dlog = (Math.log(pStart) - Math.log(pEnd)) / steps;
 
-    for (let i = 0; i < steps; i++) {
-      const pNext = Math.exp(Math.log(p) - dlog);
-      const q =
-        (sourceFlow(p) * rootsGain(p)) / Math.max(network.penalty, 1);
+    /* Phase A : aval vannes seul */
+    if (pReseau < ATM) {
+      let p = ATM;
+      const dlog = (Math.log(ATM) - Math.log(pReseau)) / steps;
 
-      if (q > 0) {
-        t += (totalVolume / q) * Math.log(p / pNext) * 3600;
+      for (let i = 0; i < steps; i++) {
+        const pNext = Math.exp(Math.log(p) - dlog);
+        const q = sourceFlow(p) / penalty;
+
+        if (q > 0) {
+          t += (volumeAval / q) * Math.log(p / pNext) * 3600;
+        }
+        p = pNext;
       }
-      p = pNext;
+    }
+
+    /* Phase B : volume total */
+    if (pReseau > pFinal) {
+      let p = pReseau;
+      const volumeTotal = volumeAval + volumeAmont;
+      const dlog =
+        (Math.log(pReseau) - Math.log(pFinal)) / steps;
+
+      for (let i = 0; i < steps; i++) {
+        const pNext = Math.exp(Math.log(p) - dlog);
+        const q =
+          (sourceFlow(p) * rootsGain(p)) / penalty;
+
+        if (q > 0) {
+          t +=
+            (volumeTotal / q) *
+            Math.log(p / pNext) *
+            3600;
+        }
+        p = pNext;
+      }
     }
 
     return isFinite(t) ? t : null;
-  }, [totalVolume, s, network]);
+  }, [s, volumeAval, volumeAmont, penalty]);
+
+  /* ───────── UI ───────── */
 
   return (
     <div className="app">
       <h1>Calculateur Vide Multivac</h1>
 
       <h2>Outillage</h2>
-      <input type="number" step="any" placeholder="Laize (mm)" value={s.laize} onChange={(e) => u("laize", e.target.value)} />
-      <input type="number" step="any" placeholder="Pas d’avance (mm)" value={s.pitch} onChange={(e) => u("pitch", e.target.value)} />
-      <input type="number" step="any" placeholder="Profondeur (mm)" value={s.depth} onChange={(e) => u("depth", e.target.value)} />
+      <input type="number" step="any" placeholder="Laize (mm)"
+        value={s.laize} onChange={(e) => u("laize", e.target.value)} />
+      <input type="number" step="any" placeholder="Pas d’avance (mm)"
+        value={s.pitch} onChange={(e) => u("pitch", e.target.value)} />
+      <input type="number" step="any" placeholder="Profondeur (mm)"
+        value={s.depth} onChange={(e) => u("depth", e.target.value)} />
 
       <label>
-        <input type="checkbox" checked={s.hasFillers} onChange={(e) => u("hasFillers", e.target.checked)} />
+        <input type="checkbox"
+          checked={s.hasFillers}
+          onChange={(e) => u("hasFillers", e.target.checked)} />
         Cales de remplissage
       </label>
 
       {s.hasFillers && (
-        <input type="number" step="any" placeholder="Épaisseur cales (mm)" value={s.fillerThickness} onChange={(e) => u("fillerThickness", e.target.value)} />
+        <input type="number" step="any"
+          placeholder="Épaisseur cales (mm)"
+          value={s.fillerThickness}
+          onChange={(e) => u("fillerThickness", e.target.value)} />
       )}
 
-      <div className="result light">Volume outillage : <strong>{toolingVolume.toFixed(4)} m³</strong></div>
+      <div className="result light">
+        Volume outillage : <strong>{volumeOutillage.toFixed(4)} m³</strong>
+      </div>
 
       <h2>Source de vide</h2>
-      <label><input type="radio" checked={s.sourceType === "network"} onChange={() => u("sourceType", "network")} /> Réseau de vide</label>
-      <label><input type="radio" checked={s.sourceType === "pump"} onChange={() => u("sourceType", "pump")} /> Pompe locale</label>
+      <label>
+        <input type="radio"
+          checked={s.sourceType === "network"}
+          onChange={() => u("sourceType", "network")} />
+        Réseau de vide
+      </label>
+      <label>
+        <input type="radio"
+          checked={s.sourceType === "pump"}
+          onChange={() => u("sourceType", "pump")} />
+        Pompe locale
+      </label>
 
       {s.sourceType === "network" && (
-        <input type="number" step="any" placeholder="Pression réseau (mbar abs)" value={s.networkPressure} onChange={(e) => u("networkPressure", e.target.value)} />
+        <input type="number" step="any"
+          placeholder="Pression réseau (mbar abs)"
+          value={s.networkPressure}
+          onChange={(e) => u("networkPressure", e.target.value)} />
       )}
 
       {s.sourceType === "pump" && (
-        <select value={s.pumpModel} onChange={(e) => u("pumpModel", e.target.value)}>
-          {Object.keys(primaryPumpModels).map((p) => <option key={p}>{p}</option>)}
+        <select value={s.pumpModel}
+          onChange={(e) => u("pumpModel", e.target.value)}>
+          {Object.keys(primaryPumpModels).map((p) =>
+            <option key={p}>{p}</option>
+          )}
         </select>
       )}
 
       <h2>Roots</h2>
-      <select value={s.rootsModel} onChange={(e) => u("rootsModel", e.target.value)}>
-        {Object.keys(rootsModels).map((r) => <option key={r}>{r}</option>)}
+      <select value={s.rootsModel}
+        onChange={(e) => u("rootsModel", e.target.value)}>
+        {Object.keys(rootsModels).map((r) =>
+          <option key={r}>{r}</option>
+        )}
       </select>
 
-      <h2>Réseau de vide</h2>
-      <input type="number" step="any" placeholder="Longueur pompe → distributeur (m)" value={s.mainLength} onChange={(e) => u("mainLength", e.target.value)} />
-      {s.rootsModel !== "Aucune" && (
-        <input type="number" step="any" placeholder="Longueur Roots → distributeur (m)" value={s.rootsLength} onChange={(e) => u("rootsLength", e.target.value)} />
-      )}
+      <h2>Vannes de vide</h2>
+      <label>
+        <input type="radio"
+          checked={s.valvePosition === "close"}
+          onChange={() => u("valvePosition", "close")} />
+        Vannes proches de l’outillage
+      </label>
+      <label>
+        <input type="radio"
+          checked={s.valvePosition === "remote"}
+          onChange={() => u("valvePosition", "remote")} />
+        Vannes déportées
+      </label>
 
-      <h3>Coudes</h3>
-      <input type="number" step="1" placeholder="Petits rayons avant Roots" value={s.smallBendsBefore} onChange={(e) => u("smallBendsBefore", e.target.value)} />
-      <input type="number" step="1" placeholder="Grands rayons avant Roots" value={s.largeBendsBefore} onChange={(e) => u("largeBendsBefore", e.target.value)} />
-      {s.rootsModel !== "Aucune" && (
+      {s.valvePosition === "remote" && (
         <>
-          <input type="number" step="1" placeholder="Petits rayons après Roots" value={s.smallBendsAfter} onChange={(e) => u("smallBendsAfter", e.target.value)} />
-          <input type="number" step="1" placeholder="Grands rayons après Roots" value={s.largeBendsAfter} onChange={(e) => u("largeBendsAfter", e.target.value)} />
+          <input type="number" step="any"
+            placeholder="Longueur aval vannes (m)"
+            value={s.downstreamLength}
+            onChange={(e) => u("downstreamLength", e.target.value)} />
+          <select
+            value={s.downstreamDiameter}
+            onChange={(e) => u("downstreamDiameter", e.target.value)}>
+            <option value={22}>Ø22</option>
+            <option value={32}>Ø32</option>
+          </select>
         </>
       )}
 
       <h2>Objectif</h2>
-      <input type="number" step="any" placeholder="Vide final (mbar abs)" value={s.finalPressure} onChange={(e) => u("finalPressure", e.target.value)} />
+      <input type="number" step="any"
+        placeholder="Vide final (mbar abs)"
+        value={s.finalPressure}
+        onChange={(e) => u("finalPressure", e.target.value)} />
 
       <div className="result">
-        {time !== null ? <>Temps estimé : <strong>{time.toFixed(3)} s</strong></> : <>Renseigne les paramètres</>}
+        {time !== null
+          ? <>Temps estimé : <strong>{time.toFixed(3)} s</strong></>
+          : <>Renseigne les paramètres</>}
       </div>
     </div>
   );
 }
+``
